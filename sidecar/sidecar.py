@@ -6,6 +6,8 @@ from kubernetes.client.rest import ApiException
 from urllib3.exceptions import ProtocolError
 from requests.packages.urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+import queue
+import threading
 
 
 def writeTextToFile(folder, filename, data):
@@ -58,10 +60,18 @@ def removeFile(folder, filename):
 def listConfigmaps(label, targetFolder, url, method, payload, current, folderAnnotation):
     v1 = client.CoreV1Api()
     namespace = os.getenv("NAMESPACE")
-    if namespace is None:
+    namespace_label_selector = os.getenv("NAMESPACE_LABELS")
+    if namespace is None and namespace_label_selector is None:
         ret = v1.list_namespaced_config_map(namespace=current)
+        items = ret.items
     elif namespace == "ALL":
         ret = v1.list_config_map_for_all_namespaces()
+        items = ret.items
+    elif namespace_label_selector:
+        match_labels = dict(m.split("=") for m in namespace_label_selector.split(","))
+        items = []
+        for ns in v1.list_namespace(label_selector={"match_labels": match_labels}):
+            items.extend(v1.list_namespaced_config_map(namespace=ns))
     else:
         ret = v1.list_namespaced_config_map(namespace=namespace)
     for cm in ret.items:
@@ -96,10 +106,35 @@ def watchForChanges(label, targetFolder, url, method, payload, current, folderAn
     w = watch.Watch()
     stream = None
     namespace = os.getenv("NAMESPACE")
-    if namespace is None:
+    namespace_label_selector = os.getenv("NAMESPACE_LABELS")
+    if namespace is None and namespace_label_selector is None:
         stream = w.stream(v1.list_namespaced_config_map, namespace=current)
     elif namespace == "ALL":
         stream = w.stream(v1.list_config_map_for_all_namespaces)
+    elif namespace_label_selector:
+        match_labels = dict(m.split("=") for m in namespace_label_selector.split(","))
+        queue = queue.Queue()
+        workers = []
+
+        def queue_worker(list_func, *args, **kwargs):
+            for event in watch.Watch().stream(list_func, *args, **kwargs):
+                queue.put(event)
+
+        for ns in v1.list_namespace(label_selector={"match_labels": match_labels}):
+            t = threading.Thread(
+                daemon=True,
+                target=queue_worker,
+                name='watcher-{}'.format(ns),
+                args=(v1.list_namespaced_config_map,),
+                kwargs={"namespace": ns},
+            )
+            workers.append(t)
+            t.start()
+        
+        def event_stream():
+            while True:
+                yield queue.get()
+        stream = event_stream()
     else:
         stream = w.stream(v1.list_namespaced_config_map, namespace=namespace)
     for event in stream:
