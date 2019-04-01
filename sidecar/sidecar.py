@@ -68,13 +68,13 @@ def listConfigmaps(label, targetFolder, url, method, payload, current, folderAnn
         ret = v1.list_config_map_for_all_namespaces()
         items = ret.items
     elif namespace_label_selector:
-        match_labels = dict(m.split("=") for m in namespace_label_selector.split(","))
         items = []
-        for ns in v1.list_namespace(label_selector={"match_labels": match_labels}):
-            items.extend(v1.list_namespaced_config_map(namespace=ns))
+        for ns in v1.list_namespace(label_selector=namespace_label_selector).items:
+            items.extend(v1.list_namespaced_config_map(namespace=ns.metadata.name).items)
     else:
         ret = v1.list_namespaced_config_map(namespace=namespace)
-    for cm in ret.items:
+        items = ret.items
+    for cm in items:
         destFolder = targetFolder
         metadata = cm.metadata
         if metadata.labels is None:
@@ -112,28 +112,27 @@ def watchForChanges(label, targetFolder, url, method, payload, current, folderAn
     elif namespace == "ALL":
         stream = w.stream(v1.list_config_map_for_all_namespaces)
     elif namespace_label_selector:
-        match_labels = dict(m.split("=") for m in namespace_label_selector.split(","))
-        queue = queue.Queue()
+        change_queue = queue.Queue()
         workers = []
 
-        def queue_worker(list_func, *args, **kwargs):
-            for event in watch.Watch().stream(list_func, *args, **kwargs):
-                queue.put(event)
+        def queue_worker(namespace):
+            for event in watch.Watch().stream(v1.list_namespaced_config_map, namespace=namespace):
+                change_queue.put(event)
 
-        for ns in v1.list_namespace(label_selector={"match_labels": match_labels}):
+        for ns in v1.list_namespace(label_selector=namespace_label_selector).items:
             t = threading.Thread(
                 daemon=True,
                 target=queue_worker,
-                name='watcher-{}'.format(ns),
-                args=(v1.list_namespaced_config_map,),
-                kwargs={"namespace": ns},
+                name='watcher-{}'.format(ns.metadata.name),
+                args=(ns.metadata.name,),
             )
             workers.append(t)
             t.start()
         
         def event_stream():
             while True:
-                yield queue.get()
+                event = change_queue.get()
+                yield event
         stream = event_stream()
     else:
         stream = w.stream(v1.list_namespaced_config_map, namespace=namespace)
